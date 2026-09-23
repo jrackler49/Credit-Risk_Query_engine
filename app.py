@@ -5,7 +5,7 @@ questions in plain English and receive verified, auditable answers.
 
 Deployment notes:
 - Place credit_risk_portfolio.db in the same directory as this file.
-- Set OPENAI_API_KEY (and OPENAI_BASE_URL if using a custom endpoint) as a
+- Set OPENAI_API_KEY (and OPENAI_API_BASE if using a custom endpoint) as a
   Streamlit secret (Settings > Secrets) or environment variable before running.
 """
 
@@ -42,8 +42,10 @@ os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 if OPENAI_API_BASE:
     os.environ["OPENAI_BASE_URL"] = OPENAI_API_BASE
 
+# llm handles generation/classification; evaluator_llm is a distinct, stronger model
+# so the same model isn't grading its own SQL in the validation gate.
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-evaluator_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+evaluator_llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
 # ---------------------------------------------------------------------------
 # Database connection (read-only) and schema context
@@ -206,15 +208,16 @@ LIMIT 5
 
 sql_7 = """
 SELECT
-    loan_account_number,
-    borrower_name,
-    sector_code,
-    ROUND(total_outstanding / 1e6, 2) AS outstanding_mn,
-    days_past_due,
-    asset_classification
-FROM loan_master
-WHERE days_past_due > 0
-ORDER BY days_past_due DESC
+    lm.loan_account_number,
+    lm.borrower_name,
+    sm.sector_name,
+    ROUND(lm.total_outstanding / 1e6, 2) AS outstanding_mn,
+    lm.days_past_due,
+    lm.asset_classification
+FROM loan_master lm
+JOIN sector_master sm ON lm.sector_code = sm.sector_code
+WHERE lm.days_past_due > 0
+ORDER BY lm.days_past_due DESC
 """
 
 sql_8 = """
@@ -260,6 +263,67 @@ GROUP BY reporting_date
 ORDER BY reporting_date
 """
 
+sql_11 = """
+SELECT
+    CASE WHEN sm.is_sensitive_sector = 1 THEN 'Sensitive' ELSE 'Non-Sensitive' END AS sector_sensitivity,
+    COUNT(*) AS loan_count,
+    ROUND(SUM(lm.total_outstanding) / 1e6, 2) AS total_outstanding_mn,
+    ROUND(SUM(CASE WHEN lm.asset_classification IN ('Substandard', 'Doubtful', 'Loss')
+                    THEN lm.total_outstanding ELSE 0 END) / 1e6, 2) AS npa_outstanding_mn
+FROM loan_master lm
+JOIN sector_master sm ON lm.sector_code = sm.sector_code
+GROUP BY sector_sensitivity
+ORDER BY total_outstanding_mn DESC
+"""
+
+sql_12 = """
+SELECT
+    CASE WHEN is_secured = 1 THEN 'Secured' ELSE 'Unsecured' END AS security_status,
+    COUNT(*) AS loan_count,
+    ROUND(SUM(total_outstanding) / 1e6, 2) AS total_outstanding_mn,
+    ROUND(SUM(CASE WHEN asset_classification IN ('Substandard', 'Doubtful', 'Loss') THEN total_outstanding ELSE 0 END) / 1e6, 2) AS npa_outstanding_mn,
+    ROUND(100.0 * SUM(CASE WHEN asset_classification IN ('Substandard', 'Doubtful', 'Loss') THEN total_outstanding ELSE 0 END) / SUM(total_outstanding), 2) AS npa_rate_pct
+FROM loan_master
+GROUP BY security_status
+ORDER BY total_outstanding_mn DESC
+"""
+
+sql_13 = """
+SELECT
+    loan_account_number,
+    borrower_name,
+    maturity_date,
+    ROUND(total_outstanding / 1e6, 2) AS outstanding_mn,
+    asset_classification
+FROM loan_master
+WHERE julianday(maturity_date) - julianday('2025-09-30') BETWEEN 0 AND 90
+ORDER BY maturity_date ASC
+"""
+
+sql_14 = """
+SELECT
+    internal_rating,
+    COUNT(*) AS borrower_count,
+    ROUND(AVG(pd_estimate) * 100, 2) AS avg_pd_pct
+FROM borrower_rating
+WHERE rating_date = '2025-09-30'
+GROUP BY internal_rating
+ORDER BY internal_rating
+"""
+
+sql_15 = """
+SELECT
+    p.loan_account_number,
+    lm.borrower_name,
+    p.ecl_amount,
+    p.provision_held,
+    ROUND(p.ecl_amount - p.provision_held, 2) AS shortfall_usd
+FROM provisioning p
+JOIN loan_master lm ON p.loan_account_number = lm.loan_account_number
+WHERE p.reporting_date = '2025-09-30' AND p.provision_held < p.ecl_amount
+ORDER BY shortfall_usd DESC
+"""
+
 verified_query_library = {
     'VQ1': {'description': 'Sector-wise total outstanding and NPA amount breakdown across all sectors', 'sql': sql_1},
     'VQ2': {'description': 'Total portfolio outstanding broken down by loan category (Corporate, Mid-Corporate, SME)', 'sql': sql_2},
@@ -271,6 +335,11 @@ verified_query_library = {
     'VQ8': {'description': 'Distribution of loans across days-past-due buckets showing aging profile of the portfolio', 'sql': sql_8},
     'VQ9': {'description': 'Borrowers whose internal rating was downgraded in the latest rating cycle', 'sql': sql_9},
     'VQ10': {'description': 'Expected credit loss trend across all reporting quarters showing provisioning movement over time', 'sql': sql_10},
+    'VQ11': {'description': 'Exposure and NPA breakdown between regulator-sensitive and non-sensitive sectors', 'sql': sql_11},
+    'VQ12': {'description': 'Secured vs unsecured exposure with NPA rate comparison', 'sql': sql_12},
+    'VQ13': {'description': 'Loans maturing within the next 90 days, for rollover and refinancing risk monitoring', 'sql': sql_13},
+    'VQ14': {'description': 'Borrower count and average probability of default by internal credit rating grade', 'sql': sql_14},
+    'VQ15': {'description': 'Loans where provision held is less than expected credit loss, indicating a provisioning shortfall', 'sql': sql_15},
 }
 
 # ---------------------------------------------------------------------------
@@ -281,31 +350,38 @@ def classify_intent(user_question, query_library):
     library_descriptions = '\n'.join(
         [f"{qid}: {entry['description']}" for qid, entry in query_library.items()]
     )
-    classification_prompt = f"""
-You are an intent router for a credit-risk analytics query engine at a commercial bank.
 
-Given a user's natural-language question, decide whether it can be fully answered by one of
-the pre-approved VERIFIED QUERY templates below, or whether it requires a freshly GENERATED
-SQL query.
+    # Optimized prompt from the lightweight optimization loop (0.80 -> 1.00).
+    # Built with .replace() rather than an f-string because the OUTPUT section
+    # contains literal JSON braces.
+    classification_prompt_template = """You are an intent router for a credit-risk analytics query engine at a commercial bank.
 
-Choose "verified" ONLY if a template matches the question's metric, grouping, and level of
-aggregation. If the question asks for a filter, calculation, or combination that no template
-covers, choose "generated" instead of forcing a partial match.
+Given a user's natural-language question, decide whether it can be fully answered by one of the pre-approved VERIFIED QUERY templates below, or whether it requires a freshly GENERATED SQL query.
+
+Choose "verified" ONLY if a template matches the question's metric, grouping, and level of aggregation. If the question asks for a filter, calculation, or combination that no template covers, choose "generated" instead of forcing a partial match. 
+
+For example, if the question is about the total amount in a specific category and the template covers that category, select "verified." However, if the question involves a breakdown or a specific condition not covered by any template, select "generated."
 
 ### USER QUESTION
+
 {user_question}
+
+### AVAILABLE VERIFIED QUERY TEMPLATES
 
 {library_descriptions}
 
 ### OUTPUT
+
 Return ONLY a valid JSON dictionary with these exact keys:
-{{
-  "route": "verified" or "generated",
-  "query_id": "VQ1" or "VQ2" ... "VQ10" or null,
-  "match_reason": "one short sentence explaining the decision"
-}}
-Do not include any other text.
-"""
+{"route": "verified" or "generated", "query_id": "VQ1" ... "VQ15" or null, "match_reason": "one short sentence"} 
+Do not include any other text."""
+
+    classification_prompt = (
+        classification_prompt_template
+        .replace('{user_question}', user_question)
+        .replace('{library_descriptions}', library_descriptions)
+    )
+
     response = llm.invoke(classification_prompt).content.strip()
     json_match = re.search(r'\{.*\}', response, re.DOTALL)
     if json_match:
